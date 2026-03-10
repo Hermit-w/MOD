@@ -22,7 +22,7 @@ def transform(i, case):
 
 if __name__ == '__main__':
     prefix_name = ORIGIN_DATA_PATH
-    dataset_name = "code_search_net/python/1.0.0/8f2524e6b62f65af5f5d65c53715c654db7b08dc93e0b7bcce2ab2f286a75be1"
+    dataset_name = "code-search-net/code_search_net/python"
     dataset_path = os.path.join(prefix_name, dataset_name)
     dataset = DatasetWrapper(dataset_path)
-    dataset.extract_data(dataset.dataset.keys(), transform, enforce_output_name="data/code_python_train.json")
+    dataset.extract_data(dataset.dataset.keys(), transform, size=3000, enforce_output_name="data/code_python_{}.json")

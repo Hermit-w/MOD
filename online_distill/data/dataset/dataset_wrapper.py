@@ -37,6 +37,7 @@ class DatasetWrapper:
         splits: Union[str, list[str]],
         transform: Callable[[int, dict[str, str]], dict[str, list[str]]],
         size: int = -1,
+        shuffle: bool = False,
         prefix: Optional[str] = None,
         enforce_output_name: Optional[str] = None,
     ):
@@ -48,12 +49,13 @@ class DatasetWrapper:
                 cases.append(transform(idx, case))
 
             if size > 0:
-                random.shuffle(cases)
+                if shuffle:
+                    random.shuffle(cases)
                 cases = cases[:size]
             if enforce_output_name is None:
                 output_file = self.get_output_filename(split, prefix)
             else:
-                output_file = enforce_output_name
+                output_file = enforce_output_name.format(split)
 
             with open(output_file, 'w') as f:
                 json.dump(cases, f, indent=4)

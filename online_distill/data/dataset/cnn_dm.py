@@ -4,17 +4,17 @@ from dataset_wrapper import ORIGIN_DATA_PATH, DatasetWrapper
 
 
 def transform(i, case):
-    INSTRUCTION = "Provide solution for the following goal.\n"
+    INSTRUCTION = "Please summary the following article:\n"
     _case = {}
     _case["id"] = i
     _case["conversation"] = [
         {
             "role": "user",
-            "content":  INSTRUCTION + case['goal']
+            "content": INSTRUCTION + case['article']
         },
         {
             "role": "assistant",
-            "content": case['sol1'] if case["label"] == 0 else case['sol2']
+            "content": case['highlights']
         }
     ]
     return _case
@@ -22,7 +22,7 @@ def transform(i, case):
 
 if __name__ == '__main__':
     prefix_name = ORIGIN_DATA_PATH
-    dataset_name = "ybisk/piqa"
+    dataset_name = "abisee/cnn_dailymail"
     dataset_path = os.path.join(prefix_name, dataset_name)
-    dataset = DatasetWrapper(dataset_path, "plain_text")
-    dataset.extract_data(dataset.dataset.keys(), transform)
+    dataset = DatasetWrapper(dataset_path, '3.0.0')
+    dataset.extract_data(dataset.dataset.keys(), transform, 3000)

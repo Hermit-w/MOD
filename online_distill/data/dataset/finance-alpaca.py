@@ -25,5 +25,5 @@ if __name__ == '__main__':
     dataset_name = "gbharti/finance-alpaca"
     dataset_path = os.path.join(prefix_name, dataset_name)
     dataset = DatasetWrapper(dataset_path)
-    dataset.extract_data(dataset.dataset.keys(), transform)
+    dataset.extract_data(dataset.dataset.keys(), transform, size=3000)
     # print(dataset.get_raw_data()["train"][0])

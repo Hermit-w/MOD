@@ -1,15 +1,18 @@
+import logging
+import contextlib
 from typing import TYPE_CHECKING, Any, Dict, override
 
 import ray
 import torch
 from transformers import Trainer
+from vllm.distributed.weight_transfer.nccl_engine import \
+    NCCLWeightTransferEngine
+from vllm.utils.network_utils import get_ip, get_open_port
 
 if TYPE_CHECKING:
     from transformers.modeling_outputs import CausalLMOutput
 
-from vllm.distributed.weight_transfer.nccl_engine import \
-    NCCLWeightTransferEngine
-from vllm.utils.network_utils import get_ip, get_open_port
+logger = logging.getLogger(__name__)
 
 
 @ray.remote(num_gpus=1)
@@ -36,9 +39,13 @@ class DistillTrainer(Trainer):
         kl_loss = torch.nn.functional.kl_div(
             student_logprobs,
             teacher_logprobs,
+            log_target=True,
             reduction="none"
         )
-        kl_loss = (kl_loss * loss_mask.unsqueeze(-1)).sum(-1) / loss_mask.sum(-1)
+        # kl_loss shape: (batch_size, output_len, vocab_size)
+        # loss_mask shape: (batch_size, output_len)
+        # calculate the mean kl_loss over the output tokens, and then mean over the batch
+        kl_loss = (kl_loss * loss_mask.unsqueeze(-1)).sum((1, 2)) / loss_mask.sum(-1)
         kl_loss = kl_loss.mean()
         return (kl_loss, student_outputs) if return_outputs else kl_loss
 
@@ -80,19 +87,32 @@ class DistillTrainer(Trainer):
 
     def update(self, inputs: Dict[str, Any]):
         """Perform a single training step."""
-        if self.optimizer is None:
+        if self.optimizer is None or self.lr_scheduler is None:
             raise RuntimeError("Optimizer and scheduler not initialized. Call init_training() first.")
 
-        self.model.train()
-        inputs = self._prepare_inputs(inputs)
+        cp_context, inputs = self._prepare_context_parallel_inputs(self.model, inputs)
 
-        # compute_loss handles forward pass and loss calculation
-        loss = self.compute_loss(self.model, inputs)
+        with cp_context():
+            self.model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
 
-        self.accelerator.backward(loss)
+            inputs = self._prepare_inputs(inputs)
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(self.model, inputs)
+
+            del inputs
+
+            kwargs = {}
+
+            self.accelerator.backward(loss, **kwargs)
 
         if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-            self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+            self.accelerator.clip_grad_norm_(
+                self.model.parameters(),
+                self.args.max_grad_norm,
+            )
 
         self.optimizer.step()
         self.lr_scheduler.step()

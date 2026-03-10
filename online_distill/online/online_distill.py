@@ -1,12 +1,15 @@
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import ray
 import torch
+import yaml
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
+                          TrainingArguments)
 from vllm import SamplingParams
 from vllm.config import CompilationMode, WeightTransferConfig
 
@@ -16,9 +19,11 @@ from ..trainer.distill_trainer import DistillTrainer
 from ..utils.update_weight import update_drafter_weights
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
+    from transformers import PretrainedConfig, PreTrainedTokenizerBase
     from vllm import RequestOutput
     from vllm.v1.metrics.reader import Metric
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -71,6 +76,9 @@ class DistillBuffer:
     prototype_data: torch.Tensor
     request_buffer: list[DistillSample]
 
+    def update_buffer(self, new_samples: list[DistillSample]):
+        self.request_buffer.extend(new_samples)
+
 
 class OnlineDistillWorker:
     def __init__(
@@ -84,6 +92,8 @@ class OnlineDistillWorker:
         training_args: TrainingArguments,
         num_training_steps: int,
         max_tokens: int = 128,
+        kl_loss_ratio: float = 1.0,
+        loss_on_wrong_tokens: bool = True,
         buffer_size_threshold: int = 16,
         enable_multi_drafters: bool = False,
         enable_online_update: bool = False,
@@ -95,6 +105,12 @@ class OnlineDistillWorker:
         self.buffer_size_threshold = buffer_size_threshold
         self.enable_multi_drafters = enable_multi_drafters
         self.enable_online_update = enable_online_update
+        self.num_gpus_train = num_gpus_train
+        self.num_gpus_inference = num_gpus_inference
+        self.num_gpus_transformer = num_gpus_transformer
+        self.output_dir = training_args.output_dir
+        self.kl_loss_ratio = kl_loss_ratio
+        self.loss_on_wrong_tokens = loss_on_wrong_tokens
 
         self._cache_metrics: dict[str, int | list[int]] | None = None
         self.sample_buffer: list[DistillBuffer] = []
@@ -110,6 +126,7 @@ class OnlineDistillWorker:
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         ray.init()
         self.tokenizer: "PreTrainedTokenizerBase" = AutoTokenizer.from_pretrained(model_name)
+        self.model_config: "PretrainedConfig" = AutoConfig.from_pretrained(model_name)
         self.trainer = self._get_training_instance(
             model_name=draft_model_name,
             num_gpus_train=num_gpus_train,
@@ -129,14 +146,16 @@ class OnlineDistillWorker:
         self._init_weight_engine()
 
     def _init_weight_engine(self):
+        if not self.enable_online_update:
+            return
         master_address, master_port = ray.get(self.trainer.get_master_address_and_port.remote())
-        world_size = ray.get(self.llm.get_world_size.remote()) + 1
+        world_size = ray.get(self.llm.get_world_size.remote()) + self.num_gpus_train
         inference_handle = self.llm.init_weight_transfer_engine.remote(
             dict(
                 init_info=dict(
                     master_address=master_address,
                     master_port=master_port,
-                    rank_offset=1,
+                    rank_offset=self.num_gpus_train,
                     world_size=world_size,
                 )
             )
@@ -313,11 +332,17 @@ class OnlineDistillWorker:
         )
 
     def _update_sample_buffer(self, outputs: list["RequestOutput"]):
+        vocab_size = self.model_config.vocab_size
         samples = [
-            DistillSample.from_request_output(output, vocab_size=self.tokenizer.vocab_size) for output in outputs
+            DistillSample.from_request_output(
+                output, vocab_size=vocab_size, only_loss_on_wrong_ids=self.loss_on_wrong_tokens
+                ) for output in outputs
         ]
         if not self.enable_multi_drafters:
-            self.sample_buffer.append(DistillBuffer(prototype_data=torch.tensor(0), request_buffer=samples))
+            if len(self.sample_buffer) == 0:
+                self.sample_buffer.append(DistillBuffer(prototype_data=torch.tensor(0), request_buffer=samples))
+            else:
+                self.sample_buffer[0].update_buffer(samples)
 
     def _maybe_do_training(self):
         assert not self.enable_multi_drafters, "Multi-drafters is not supported in this version."
@@ -328,7 +353,8 @@ class OnlineDistillWorker:
             update_handel = self.trainer.update.remote(inputs_for_trainer)
             # clear the buffer
             self.sample_buffer[0].request_buffer = []
-            ray.get(update_handel)
+            loss = ray.get(update_handel)
+            logger.info(f"Finished a training step with loss: {loss}")
             self.update_weight()
 
     def update_weight(self):
@@ -347,3 +373,12 @@ class OnlineDistillWorker:
         train_handle = self.trainer.broadcast_weights.remote(packed=True)
 
         ray.get([train_handle, inference_handle])
+
+    def save_metrics(self):
+        output_dir = self.output_dir
+        metrics_file = os.path.join(output_dir, "spec_metrics.yaml")
+        with open(metrics_file, 'w') as f:
+            yaml.dump(dict(
+                alpha=self.alphas,
+                alpha_per_pos=self.alpha_per_pos,
+            ), f, default_flow_style=False)
